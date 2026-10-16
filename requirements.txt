@@ -1,0 +1,5 @@
+akshare==1.19.1
+fastapi==0.143.0
+uvicorn==0.54.0
+httpx==0.28.1
+websockets==15.0.1

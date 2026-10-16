@@ -1,0 +1,32 @@
+[Unit]
+Description=ReBS OKX market terminal
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=rebs
+Group=rebs
+WorkingDirectory=/opt/rebs/current
+Environment=PYTHONUNBUFFERED=1
+Environment=HOME=/var/lib/rebs
+EnvironmentFile=-/etc/rebs/rebs.env
+EnvironmentFile=-/etc/rebs/rebs.demo.env
+Environment=REBS_DEMO_STATE_PATH=/var/lib/rebs/demo-orders.sqlite3
+Environment=REBS_STRATEGY_STATE_PATH=/var/lib/rebs/strategies.sqlite3
+ExecStart=/opt/rebs/current/.venv/bin/python -m uvicorn backend.app:app --host 127.0.0.1 --port 18080 --proxy-headers --forwarded-allow-ips 127.0.0.1
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=25
+StateDirectory=rebs
+CacheDirectory=rebs
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+UMask=0027
+LimitNOFILE=8192
+
+[Install]
+WantedBy=multi-user.target
