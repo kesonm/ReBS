@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { dispose, init, type Chart, type DataLoaderGetBarsParams, type KLineData } from 'klinecharts'
-import { getCandles } from '../api'
-import type { Bar, Candle, CandlePeriod, CandlesResponse, ChartRange, Instrument } from '../types'
+import { getCandles, MarketRequestError } from '../api'
+import type { Bar, Candle, CandlePeriod, CandlesResponse, ChartRange, HistoryState, Instrument } from '../types'
 
 const props = defineProps<{
   instrument: Instrument
@@ -11,6 +11,7 @@ const props = defineProps<{
   showMA: boolean
   showMACD: boolean
   refreshKey: number
+  active: boolean
 }>()
 
 const emit = defineEmits<{
@@ -19,6 +20,7 @@ const emit = defineEmits<{
   error: [message: string]
   loading: [loading: boolean]
   more: [available: boolean]
+  historyState: [state: HistoryState]
 }>()
 
 const host = ref<HTMLDivElement>()
@@ -26,6 +28,7 @@ const busy = ref(false)
 const empty = ref(false)
 const failure = ref('')
 const paging = ref(false)
+const retryWaiting = ref(false)
 const RED = '#f45b6e'
 const GREEN = '#21c7a0'
 const NEUTRAL = '#8392a9'
@@ -43,6 +46,35 @@ let bars: Candle[] = []
 let hasMore = false
 let paginationFailed = false
 let liveUpdate: ((data: KLineData) => void) | undefined
+let retryTimer: ReturnType<typeof setTimeout> | undefined
+let retryAttempt = 0
+let retryAt = 0
+
+function clearRetry(resetAttempts = false) {
+  clearTimeout(retryTimer)
+  retryTimer = undefined
+  retryWaiting.value = false
+  if (resetAttempts) retryAttempt = 0
+}
+
+function resumeRetry() {
+  clearTimeout(retryTimer)
+  retryTimer = undefined
+  if (!retryWaiting.value || !chart || document.hidden || !props.active || !navigator.onLine) return
+  const current = generation
+  retryTimer = setTimeout(() => {
+    if (current !== generation || document.hidden || !props.active || !navigator.onLine) return
+    reload(true)
+  }, Math.max(250, retryAt - Date.now()))
+}
+
+function scheduleRetry() {
+  retryAttempt += 1
+  retryAt = Date.now() + Math.min(30000, 2000 * 2 ** Math.min(retryAttempt - 1, 4))
+  retryWaiting.value = true
+  emit('historyState', 'retrying')
+  resumeRetry()
+}
 
 function applyLive(bar: Candle | null) {
   if (!bar || !liveUpdate || !bars.length) return
@@ -104,6 +136,7 @@ async function fetchBars(params: DataLoaderGetBarsParams) {
   controller = requestController
   setLoading(true, !initial)
   failure.value = ''
+  emit('historyState', 'loading')
 
   try {
     const response = await getCandles(props.instrument.instId, props.period, before, requestController.signal)
@@ -117,9 +150,11 @@ async function fetchBars(params: DataLoaderGetBarsParams) {
     hasMore = response.hasMore && incoming.length > 0
     emit('more', hasMore)
     paginationFailed = false
+    clearRetry(true)
     empty.value = bars.length === 0
     // Complete local state first: callback can immediately request another page.
     setLoading(false)
+    emit('historyState', empty.value ? 'empty' : 'ready')
     if (initial) emit('loaded', { ...response, bars: incoming })
     notifyRange()
     params.callback(incoming.map(toChartBar), { forward: hasMore, backward: false })
@@ -138,6 +173,8 @@ async function fetchBars(params: DataLoaderGetBarsParams) {
     // Disable this boundary after an error to avoid an automatic retry loop.
     params.callback([], { forward: false, backward: false })
     emit('error', message)
+    emit('historyState', 'error')
+    if (initial && error instanceof MarketRequestError && error.retryable) scheduleRetry()
   } finally {
     if (controller === requestController) controller = undefined
   }
@@ -152,8 +189,9 @@ function loadChartData(params: DataLoaderGetBarsParams): Promise<void> {
   return request
 }
 
-function reload() {
+function reload(automatic = false) {
   if (!chart) return
+  clearRetry(!automatic)
   generation += 1
   controller?.abort()
   controller = undefined
@@ -245,6 +283,7 @@ watch(
 )
 watch([() => props.showMA, () => props.showMACD], syncIndicators)
 watch(() => props.liveBar, applyLive)
+watch(() => props.active, resumeRetry)
 
 onMounted(() => {
   if (!host.value) return
@@ -253,6 +292,7 @@ onMounted(() => {
     failure.value = '图表初始化失败，请刷新页面。'
     empty.value = true
     emit('error', failure.value)
+    emit('historyState', 'error')
     return
   }
   chart.setStyles({
@@ -340,11 +380,18 @@ onMounted(() => {
     resizeFrame = requestAnimationFrame(() => chart?.resize())
   })
   observer.observe(host.value)
+  document.addEventListener('visibilitychange', resumeRetry)
+  window.addEventListener('online', resumeRetry)
+  window.addEventListener('offline', resumeRetry)
 })
 
 onBeforeUnmount(() => {
   generation += 1
+  clearRetry(true)
   controller?.abort()
+  document.removeEventListener('visibilitychange', resumeRetry)
+  window.removeEventListener('online', resumeRetry)
+  window.removeEventListener('offline', resumeRetry)
   observer?.disconnect()
   cancelAnimationFrame(resizeFrame)
   if (host.value) dispose(host.value)
@@ -367,6 +414,7 @@ defineExpose({ resetView, zoomIn, zoomOut, loadMore, getBars: () => [...bars] })
         <span class="stock-chart__empty-icon">⌁</span>
         <strong>{{ failure ? '行情暂时无法加载' : '暂无 K 线数据' }}</strong>
         <span>{{ failure || '请切换币对或周期，或稍后重新获取。' }}</span>
+        <span v-if="retryWaiting">网络恢复后将自动重试，也可立即重新加载。</span>
         <button type="button" @click="reload()">重新加载</button>
       </template>
     </div>

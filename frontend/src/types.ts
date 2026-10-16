@@ -75,3 +75,4 @@ export interface Book { asks: [number, number][]; bids: [number, number][]; ts: 
 export interface Trade { id: string; price: number; size: number; side: 'buy' | 'sell'; ts: number }
 export interface Snapshot { instId: string; ticker: Ticker; book: Book; trades: Trade[]; tradeSource: string; source: string }
 export type StreamState = 'connecting' | 'live' | 'reconnecting' | 'offline'
+export type HistoryState = 'loading' | 'ready' | 'empty' | 'retrying' | 'error'

@@ -3,12 +3,15 @@ from __future__ import annotations
 
 import asyncio
 from collections import OrderedDict
+from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 import json
+import logging
 import math
 import os
 import re
 import time
+from typing import Callable
 from urllib.request import getproxies
 from urllib.parse import urljoin, urlsplit
 
@@ -23,6 +26,16 @@ PERIODS = {"1s": ("second", 1), "1m": ("minute", 1), "3m": ("minute", 3),
            "1D": ("day", 1), "1W": ("week", 1), "1M": ("month", 1)}
 SOURCE = "OKX · 欧易公开行情"
 OKX_PROXY_HOSTS = frozenset({'openapi.okx.com', 'www.okx.com', 'ws.okx.com'})
+logger = logging.getLogger(__name__)
+
+
+@dataclass(eq=False)
+class _ClientState:
+    client: httpx.AsyncClient
+    active: int = 0
+    retired: bool = False
+    idle: asyncio.Event = field(default_factory=asyncio.Event)
+    close_task: asyncio.Task | None = None
 
 
 def instrument_id(value: str) -> str:
@@ -115,22 +128,101 @@ class OrderBook:
 
 
 class OKXService:
-    def __init__(self, client: httpx.AsyncClient | None = None):
+    def __init__(self, client: httpx.AsyncClient | None = None, *,
+                 client_factory: Callable[[], httpx.AsyncClient] | None = None):
         self.base_url = os.getenv('OKX_REST_URL', 'https://openapi.okx.com').rstrip('/')
         self.ws_base = os.getenv('OKX_WS_URL', 'wss://ws.okx.com/ws/v5').rstrip('/')
         self.proxy_url = os.getenv('OKX_PROXY_URL') or None
-        self.client = client
+        # An injected client has no implicit production-network replacement.
+        self._client_factory = client_factory or (self._new_client if client is None else None)
+        self._current = _ClientState(client) if client is not None else None
+        self._clients = {self._current} if self._current else set()
+        self._closing = False
         self.cache: OrderedDict[tuple, tuple[float, object]] = OrderedDict()
         self.inflight: dict[tuple, asyncio.Task] = {}
 
     async def start(self):
-        if self.client is None:
-            if self.proxy_url:
-                self.proxy_for(self.base_url)
-            self.client = httpx.AsyncClient(base_url=self.base_url,
-                timeout=httpx.Timeout(10, connect=6), limits=httpx.Limits(max_connections=16, max_keepalive_connections=8, keepalive_expiry=15),
-                headers={'User-Agent': 'ReBS-Market/2.0', 'Accept': 'application/json'},
-                proxy=self.proxy_url, trust_env=self.proxy_url is None)
+        self._closing = False
+        self._ready_client()
+
+    @property
+    def client(self) -> httpx.AsyncClient | None:
+        return self._current.client if self._current is not None else None
+
+    def _new_client(self) -> httpx.AsyncClient:
+        if self.proxy_url:
+            self.proxy_for(self.base_url)
+        return httpx.AsyncClient(base_url=self.base_url,
+            timeout=httpx.Timeout(10, connect=6), limits=httpx.Limits(max_connections=16, max_keepalive_connections=8, keepalive_expiry=15),
+            headers={'User-Agent': 'ReBS-Market/2.0', 'Accept': 'application/json'},
+            proxy=self.proxy_url, trust_env=self.proxy_url is None)
+
+    def _ready_client(self) -> _ClientState:
+        if self._closing:
+            raise RuntimeError('OKX service is closing')
+        if self._current is None:
+            if self._client_factory is None:
+                raise RuntimeError('No OKX client factory configured')
+            self._current = _ClientState(self._client_factory())
+            self._clients.add(self._current)
+        return self._current
+
+    def _retire_client(self, state: _ClientState):
+        # No await between identity check and retirement: concurrent failures on
+        # an old pool must not retire a replacement already serving new requests.
+        if self._client_factory is not None and self._current is state:
+            self._current = None
+            state.retired = True
+
+    def _close_client(self, state: _ClientState) -> asyncio.Task:
+        if state.close_task is None:
+            async def close_idle():
+                try:
+                    if state.active:
+                        await state.idle.wait()
+                    await state.client.aclose()
+                except Exception as exc:
+                    logger.warning('OKX REST client close failed error=%s', type(exc).__name__)
+                finally:
+                    self._clients.discard(state)
+            state.close_task = asyncio.create_task(close_idle())
+        return state.close_task
+
+    def log_rest_failure(self, method: str, target: str, attempt: int,
+                         error: str, status: int | None = None):
+        url = urlsplit(urljoin(self.base_url + '/', target))
+        # Never log query strings, bodies, headers or exception messages; private
+        # requests use this same transport and may contain signed credentials.
+        logger.warning('OKX REST failure method=%s host=%s path=%s attempt=%s error=%s status=%s',
+                       method, url.hostname, url.path, attempt, error, status)
+
+    async def request(self, method: str, target: str, *, attempt: int = 1, **kwargs) -> httpx.Response:
+        """Send exactly once; retire failed pools without interrupting other calls."""
+        if self.proxy_url:
+            self.proxy_for(urljoin(self.base_url + '/', target))
+        state = self._ready_client()
+        state.active += 1
+        state.idle.clear()
+        try:
+            response = await state.client.request(method, target, **kwargs)
+            if response.is_error:
+                self.log_rest_failure(method, target, attempt, 'HTTPStatusError', response.status_code)
+            return response
+        except httpx.TransportError as exc:
+            self.log_rest_failure(method, target, attempt, type(exc).__name__)
+            self._retire_client(state)
+            raise
+        except asyncio.CancelledError:
+            # Cancellation during proxy TLS negotiation can leave the same pool
+            # accounting defect as a failed handshake.
+            self._retire_client(state)
+            raise
+        finally:
+            state.active -= 1
+            if not state.active:
+                state.idle.set()
+                if state.retired:
+                    await asyncio.shield(self._close_client(state))
 
     def proxy_for(self, url: str) -> str | None:
         if self.proxy_url:
@@ -141,33 +233,41 @@ class OKXService:
         return getproxies().get('https')
 
     async def close(self):
+        self._closing = True
         tasks = list(self.inflight.values())
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        if self.client:
-            await self.client.aclose()
+        states = list(self._clients)
+        self._current = None
+        for state in states:
+            state.retired = True
+        await asyncio.gather(*(asyncio.shield(self._close_client(state)) for state in states))
 
     async def get(self, path: str, params: dict) -> list:
-        assert self.client is not None
         for attempt in range(2):
             try:
                 # Both are OKX's global public endpoints. Explicit regional/custom
                 # configuration is respected and never silently moved elsewhere.
                 target = 'https://www.okx.com' + path if attempt and self.base_url == 'https://openapi.okx.com' else path
-                if self.proxy_url:
-                    self.proxy_for(urljoin(self.base_url + '/', target))
-                response = await self.client.get(target, params=params)
+                response = await self.request('GET', target, attempt=attempt + 1, params=params)
                 response.raise_for_status()
                 body = response.json()
+                if not isinstance(body, dict):
+                    raise ValueError('Invalid response')
                 if body.get('code') != '0':
-                    raise UpstreamError(f"欧易行情返回错误（{body.get('code', 'unknown')}）：{str(body.get('msg', ''))[:180]}")
+                    code = str(body.get('code', 'unknown'))
+                    safe_code = code if code.isdigit() and len(code) <= 12 else 'unknown'
+                    self.log_rest_failure('GET', target, attempt + 1, 'ExchangeError', response.status_code)
+                    raise UpstreamError(f"欧易行情返回错误（{safe_code}），请稍后重试。")
                 if not isinstance(body.get('data'), list):
                     raise ValueError('Invalid response')
                 return body['data']
             except (InputError, UpstreamError):
                 raise
             except (httpx.HTTPError, ValueError) as exc:
+                if isinstance(exc, ValueError):
+                    self.log_rest_failure('GET', target, attempt + 1, 'InvalidResponse')
                 retryable = isinstance(exc, httpx.TransportError) or isinstance(exc, httpx.HTTPStatusError) and (exc.response.status_code >= 500 or exc.response.status_code == 429)
                 if attempt == 0 and retryable:
                     await asyncio.sleep(.35)

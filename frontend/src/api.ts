@@ -1,18 +1,42 @@
 import type { Adjust, HistoryResponse, StocksResponse } from './types'
 import type { CandlePeriod, CandlesResponse, MarketsResponse, Snapshot } from './types'
 
-async function request<T>(path: string, signal?: AbortSignal): Promise<T> {
-  const response = await fetch(`/api${path}`, { signal })
-  if (!response.ok) {
-    let message = `请求失败（${response.status}）`
-    try {
-      const body = await response.json()
-      if (typeof body.detail === 'string') message = body.detail
-      else if (typeof body.message === 'string') message = body.message
-    } catch { /* A proxy may return a non-JSON error. */ }
-    throw new Error(message)
+export class MarketRequestError extends Error {
+  constructor(message: string, public readonly retryable: boolean, public readonly status?: number) {
+    super(message)
+    this.name = 'MarketRequestError'
   }
-  return response.json() as Promise<T>
+}
+
+async function request<T>(path: string, signal?: AbortSignal): Promise<T> {
+  const controller = new AbortController()
+  let timedOut = false
+  const cancel = () => controller.abort()
+  if (signal?.aborted) cancel()
+  else signal?.addEventListener('abort', cancel, { once: true })
+  // Bound the complete request, including a response body that never finishes.
+  const timer = setTimeout(() => { timedOut = true; controller.abort() }, 30000)
+  try {
+    const response = await fetch(`/api${path}`, { signal: controller.signal })
+    if (!response.ok) {
+      let message = `请求失败（${response.status}）`
+      try {
+        const body = await response.json()
+        if (typeof body.detail === 'string') message = body.detail
+        else if (typeof body.message === 'string') message = body.message
+      } catch { /* A proxy may return a non-JSON error. */ }
+      throw new MarketRequestError(message, response.status >= 500 || [408, 429].includes(response.status), response.status)
+    }
+    return await response.json() as T
+  } catch (error) {
+    if (signal?.aborted) throw new DOMException('Request cancelled', 'AbortError')
+    if (timedOut) throw new MarketRequestError('行情请求超时，正在等待恢复。', true)
+    if (error instanceof TypeError) throw new MarketRequestError('行情网络连接暂不可用，请稍后重试。', true)
+    throw error
+  } finally {
+    clearTimeout(timer)
+    signal?.removeEventListener('abort', cancel)
+  }
 }
 
 export function searchStocks(query: string, signal?: AbortSignal) {

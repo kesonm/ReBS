@@ -9,7 +9,7 @@ import RecentTrades from './components/RecentTrades.vue'
 import DemoAccount from './components/DemoAccount.vue'
 const StrategyWorkbench = defineAsyncComponent(() => import('./components/StrategyWorkbench.vue'))
 import { useOKX } from './composables/useOKX'
-import { PERIODS, type CandlePeriod, type CandlesResponse, type ChartRange, type Instrument } from './types'
+import { PERIODS, type CandlePeriod, type CandlesResponse, type ChartRange, type HistoryState, type Instrument } from './types'
 import { price, compact, percent, time, dateTime } from './format'
 
 function stored(key: string, fallback: string) { try { return localStorage.getItem(key) ?? fallback } catch { return fallback } }
@@ -32,6 +32,7 @@ const range = ref<ChartRange | null>(null)
 const loading = ref(true)
 const more = ref(true)
 const chartError = ref('')
+const historyState = ref<HistoryState>('loading')
 const manualRefresh = ref(0)
 const lastClose = ref<number | null>(null)
 const infoTab = ref('overview')
@@ -63,7 +64,19 @@ const rangePosition = computed(() => {
   const t = currentTicker.value
   return t && t.high24h > t.low24h ? Math.max(0,Math.min(100,(t.last-t.low24h)/(t.high24h-t.low24h)*100)) : 50
 })
-const networkLabel = computed(() => live.value ? '实时连接正常' : stale.value ? '行情更新延迟' : publicState.value === 'reconnecting' || businessState.value === 'reconnecting' ? '正在重新连接' : '正在连接欧易')
+const networkLabel = computed(() => live.value ? '实时推送正常' : stale.value ? '实时推送延迟' : publicState.value === 'reconnecting' || businessState.value === 'reconnecting' ? '实时推送重连中' : '实时推送连接中')
+const historyFailed = computed(() => historyState.value === 'error' || historyState.value === 'retrying')
+const dataFailed = computed(() => !!marketError.value || historyFailed.value)
+const dataReady = computed(() => !marketError.value && !!marketUpdated.value && ['ready', 'empty'].includes(historyState.value))
+const dataLabel = computed(() => {
+  if (marketError.value && historyFailed.value) return '历史 / 币对异常'
+  if (marketError.value) return '币对列表异常'
+  if (historyState.value === 'retrying') return '历史数据重试中'
+  if (historyState.value === 'error') return '历史数据异常'
+  return dataReady.value ? '历史 / 币对正常' : '历史 / 币对加载中'
+})
+const dataStatusDetail = computed(() => `币对列表：${marketError.value ? '加载失败' : marketUpdated.value ? '正常' : '加载中'}；历史 K 线：${({ loading: '加载中', ready: '正常', empty: '暂无数据', retrying: '等待自动重试', error: '加载失败' })[historyState.value]}。点击刷新。`)
+const chartStatusLabel = computed(() => range.value ? `${range.value.count.toLocaleString()} 根 K 线` : loading.value ? '正在加载 K 线' : historyState.value === 'retrying' ? '等待自动重试' : chartError.value ? 'K 线加载失败' : '暂无 K 线数据')
 const notice = computed(() => streamError.value || (publicState.value !== 'live' && snapshotError.value) || '')
 const chartPeriodLabel = computed(() => ({'1s':'1 秒','1m':'1 分钟','3m':'3 分钟','5m':'5 分钟','15m':'15 分钟','30m':'30 分钟','1H':'1 小时','2H':'2 小时','4H':'4 小时','1D':'1 日','1W':'1 周','1M':'1 月'})[period.value])
 
@@ -87,6 +100,10 @@ function loaded(response: CandlesResponse) {
   chartError.value = ''
 }
 function chartFailure(message: string) { chartError.value = message; loading.value = false }
+function historyChanged(state: HistoryState) {
+  historyState.value = state
+  if (state === 'ready' || state === 'empty') chartError.value = ''
+}
 function refresh() { manualRefresh.value++; restart(); void refreshMarkets() }
 async function fullscreen() {
   try { if (document.fullscreenElement) await document.exitFullscreen(); else await chartPanel.value?.requestFullscreen() }
@@ -98,6 +115,7 @@ function shortcut(event: KeyboardEvent) {
 }
 watch([selectedId,period], () => {
   range.value = null; loading.value = true; more.value = true; chartError.value = ''; lastClose.value = null
+  historyState.value = 'loading'
   persist('rebs.okx.instrument',selectedId.value); persist('rebs.okx.period',period.value)
 })
 onMounted(() => { window.addEventListener('keydown',shortcut); window.addEventListener('hashchange',syncPage) })
@@ -109,7 +127,7 @@ onBeforeUnmount(() => { window.removeEventListener('keydown',shortcut); window.r
     <header class="exchange-header">
       <a class="exchange-brand" href="/" aria-label="ReBS 数字资产看盘终端"><span class="brand-emblem"><i></i><i></i><i></i><i></i><i></i></span>ReBS<span class="brand-subtitle">TERMINAL</span></a>
       <nav class="header-nav" aria-label="工作台导航"><button :class="{active:!workbenchOpen && !favoriteOnly}" @click="showMarket()">现货行情</button><button :class="{active:!workbenchOpen && favoriteOnly}" @click="showMarket(true)">我的自选 <span>{{ favorites.length }}</span></button><button @click="showDemo">模拟交易</button><button :class="{active:workbenchOpen}" @click="showStrategy">策略工作台</button></nav>
-      <div class="header-right"><span class="data-provider">行情来自 <strong>OKX 欧易</strong></span><button class="connection-pill" :class="{ online:live, warning:stale }" title="点击重新连接行情" @click="refresh"><span class="small-dot" :class="{live}"></span>{{ networkLabel }}</button><span class="local-badge">本地工作台</span></div>
+      <div class="header-right"><span class="data-provider">行情来自 <strong>OKX 欧易</strong></span><div class="connection-statuses"><button class="connection-pill stream-status" :class="{ online:live, warning:stale }" :aria-label="networkLabel" title="实时推送：盘口、成交与当前 K 线；点击重新连接" @click="refresh"><span class="small-dot" :class="{live}"></span>{{ networkLabel }}</button><button class="connection-pill history-status" :class="{ online:dataReady, warning:dataFailed }" :title="dataStatusDetail" :aria-label="dataLabel" @click="refresh"><span class="small-dot" :class="{live:dataReady}"></span>{{ dataLabel }}</button></div><span class="local-badge">本地工作台</span></div>
     </header>
 
     <div v-show="!workbenchOpen" class="ticker-ribbon"><span class="ribbon-label"><el-icon><StarFilled/></el-icon>自选行情</span><button v-for="item in savedMarkets" :key="item.instId" :class="{ selected:item.instId===selectedId }" @click="selectPair(item.instId)"><strong>{{ item.base }}/{{ item.quote }}</strong><span>{{ price(visibleTicker(item.instId)?.last,item.pricePrecision) }}</span><span :class="(visibleTicker(item.instId)?.change24h ?? 0)>=0 ? 'up':'down'">{{ percent(visibleTicker(item.instId)?.change24h) }}</span></button><span v-if="!savedMarkets.length" class="ribbon-empty">点击币对旁的星标，添加自选</span></div>
@@ -136,8 +154,8 @@ onBeforeUnmount(() => { window.removeEventListener('keydown',shortcut); window.r
           <div class="chart-tabbar"><div class="chart-tabs"><button :class="{active:chartMode==='candles'}" @click="chartMode='candles'">K 线图</button><button :class="{active:chartMode==='depth'}" @click="chartMode='depth'">深度图</button></div><div class="chart-platform"><el-icon><TrendCharts/></el-icon>专业图表<span>UTC+8</span></div></div>
           <div class="period-toolbar"><div class="period-buttons" role="group" aria-label="K线周期"><button v-for="p in PERIODS" :key="p" :class="{active:period===p}" :aria-pressed="period===p" @click="period=p;chartMode='candles'">{{ p }}</button></div><div class="chart-actions"><button class="icon-button" aria-label="缩小K线" title="缩小" @click="chartRef?.zoomOut()"><el-icon><Minus/></el-icon></button><button class="icon-button" aria-label="放大K线" title="放大" @click="chartRef?.zoomIn()"><el-icon><Plus/></el-icon></button><button class="icon-button" aria-label="全屏图表" title="全屏" @click="fullscreen"><el-icon><FullScreen/></el-icon></button></div></div>
           <div v-show="chartMode==='candles'" class="indicator-bar"><span>{{ instrument.base }}/{{ instrument.quote }} <i>·</i> {{ chartPeriodLabel }} <i>·</i> OKX</span><button :class="{active:showMA}" :aria-pressed="showMA" @click="showMA=!showMA"><i class="ma-dot"></i>MA</button><button :class="{active:showMACD}" :aria-pressed="showMACD" @click="showMACD=!showMACD"><i class="macd-dot"></i>MACD</button><span class="indicator-volume">VOL</span><span class="candle-state" :class="{forming:liveBar && !liveBar.confirmed}">{{ liveBar ? liveBar.confirmed?'K 线已收盘':'当前 K 线形成中':'历史 K 线' }}</span></div>
-          <div class="crypto-chart-stage"><StockChart v-show="chartMode==='candles'" :key="`${selectedId}:${period}`" ref="chartRef" :instrument="instrument" :period="period" :live-bar="liveBar" :show-m-a="showMA" :show-m-a-c-d="showMACD" :refresh-key="revisionKey" @loaded="loaded" @range="range=$event.count?$event:null" @more="more=$event" @loading="loading=$event" @error="chartFailure"/><DepthChart v-if="chartMode==='depth'" :book="book" :instrument="instrument" /></div>
-          <div class="chart-footer"><span><span class="small-dot" :class="{live:businessState==='live'}"></span>{{ range?`${range.count.toLocaleString()} 根 K 线`:'正在加载 K 线' }}<span v-if="range" class="range-dates">{{ dateTime(range.from) }} — {{ dateTime(range.to) }}</span></span><div><button class="text-button" @click="chartRef?.resetView()">回到最新</button><button :disabled="loading || !more || !range" class="text-button history-button" @click="chartRef?.loadMore()">{{ loading && range?'加载中…':more?'更早历史':'已到历史起点' }}<el-icon><ArrowDown/></el-icon></button></div></div>
+          <div class="crypto-chart-stage"><StockChart v-show="chartMode==='candles'" :key="`${selectedId}:${period}`" ref="chartRef" :instrument="instrument" :period="period" :live-bar="liveBar" :show-m-a="showMA" :show-m-a-c-d="showMACD" :refresh-key="revisionKey" :active="!workbenchOpen && chartMode==='candles'" @loaded="loaded" @range="range=$event.count?$event:null" @more="more=$event" @loading="loading=$event" @error="chartFailure" @history-state="historyChanged"/><DepthChart v-if="chartMode==='depth'" :book="book" :instrument="instrument" /></div>
+          <div class="chart-footer"><span><span class="small-dot" :class="{live:businessState==='live' && historyState==='ready'}"></span>{{ chartStatusLabel }}<span v-if="range" class="range-dates">{{ dateTime(range.from) }} — {{ dateTime(range.to) }}</span></span><div><button class="text-button" @click="chartRef?.resetView()">回到最新</button><button :disabled="loading || !more || !range" class="text-button history-button" @click="chartRef?.loadMore()">{{ loading && range?'加载中…':more?'更早历史':'已到历史起点' }}<el-icon><ArrowDown/></el-icon></button></div></div>
           <div v-if="chartError && range" class="chart-inline-error">{{ chartError }}</div>
         </section>
 
@@ -151,3 +169,15 @@ onBeforeUnmount(() => { window.removeEventListener('keydown',shortcut); window.r
     <footer class="status-footer"><span><span class="small-dot" :class="{live}"></span>{{ networkLabel }}<span class="footer-divider"></span>盘口 {{ publicState==='live'?'实时':publicState==='reconnecting'?'重连中':'连接中' }}<span class="footer-divider"></span>成交 / K 线 {{ businessState==='live'?'实时':businessState==='reconnecting'?'重连中':'连接中' }}</span><span>最近推送 {{ time(lastMessage) }}<span class="footer-divider"></span>{{ time(now) }} UTC+8</span></footer>
   </div>
 </template>
+
+<style scoped>
+.connection-statuses { display: flex; align-items: center; gap: 6px; }
+.connection-pill.warning .small-dot { background: #d6a96e; }
+@media (max-width: 1050px) {
+  .connection-statuses { flex-direction: column; align-items: stretch; gap: 3px; }
+  .connection-statuses .connection-pill { padding: 4px 8px; font-size: 9px; }
+}
+@media (max-width: 760px) {
+  .connection-statuses .small-dot { width: 4px; height: 4px; }
+}
+</style>

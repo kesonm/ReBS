@@ -104,7 +104,6 @@ class DemoService:
         request_path = path + ('?'+query if query else '')
         content = json.dumps(body,separators=(',',':'),ensure_ascii=True) if body is not None else ''
         await self.sync_clock()
-        assert self.market.client is not None
         # GET can retry. A POST is sent exactly once, including clock/transport errors.
         for attempt in range(2 if method == 'GET' else 1):
             timestamp = datetime.fromtimestamp(time.time()+self.clock_offset,timezone.utc).isoformat(timespec='milliseconds').replace('+00:00','Z')
@@ -114,10 +113,12 @@ class DemoService:
             if method == 'POST' and path == '/api/v5/trade/order':
                 headers['expTime'] = str(int((time.time()+self.clock_offset+10)*1000))
             try:
-                response = await self.market.client.request(method,request_path,headers=headers,content=content or None)
+                response = await self.market.request(method,request_path,attempt=attempt + 1,headers=headers,content=content or None)
                 payload = response.json()
                 if not isinstance(payload,dict): raise ValueError('Invalid response')
             except (httpx.HTTPError, ValueError) as exc:
+                if isinstance(exc, ValueError):
+                    self.market.log_rest_failure(method,path,attempt + 1,'InvalidResponse')
                 if method == 'POST':
                     raise DemoUncertain('请求结果待确认，请查询委托状态；系统不会自动重复提交。') from exc
                 if not attempt:

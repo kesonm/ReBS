@@ -44,7 +44,7 @@ def create_app(service: MarketService | None = None, *, warmup: bool = True, dis
         finally:
             await okx.close()
 
-    application = FastAPI(title="ReBS OKX Market Terminal", version="0.4.0", lifespan=lifespan)
+    application = FastAPI(title="ReBS OKX Market Terminal", version="0.4.1", lifespan=lifespan)
     application.state.market = market
     application.state.okx = okx
     application.state.demo = demo
@@ -92,7 +92,7 @@ def create_app(service: MarketService | None = None, *, warmup: bool = True, dis
 
     @application.get("/api/health")
     def health():
-        return {"status": "ok", "version": "0.4.0", "mode": "crypto-spot", "source": "OKX", "trading": False, "demoTrading": True, "strategyWorkbench": True, "strategyExecution": False}
+        return {"status": "ok", "version": "0.4.1", "mode": "crypto-spot", "source": "OKX", "trading": False, "demoTrading": True, "strategyWorkbench": True, "strategyExecution": False}
 
     @application.get("/api/okx/markets")
     async def okx_markets():
