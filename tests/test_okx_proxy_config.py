@@ -7,6 +7,8 @@ from unittest.mock import patch
 from urllib.parse import urlencode
 
 module_path=Path(__file__).resolve().parents[1]/'deploy'/'configure-okx-proxy.py'
+if not module_path.is_file():
+    raise unittest.SkipTest('Local deployment files are not included in this checkout')
 spec=importlib.util.spec_from_file_location('okx_proxy_config',module_path)
 config=importlib.util.module_from_spec(spec)
 spec.loader.exec_module(config)
