@@ -10,6 +10,9 @@ frontend/.sites-runtime/
 test-results/
 tests/.tmp/
 
+# Local deployment documentation
+/deploy/README.md
+
 # Private configuration and credentials
 .env
 .env.*
